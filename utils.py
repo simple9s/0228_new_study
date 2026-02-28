@@ -1,4 +1,14 @@
 import os
+import numpy as np
+import torch
+import random
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 def create_dir(directory):
     if not os.path.exists(directory):
