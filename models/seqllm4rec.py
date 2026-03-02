@@ -81,13 +81,13 @@ class llm4rec(nn.Module):
         # ── CLS tokens (原有逻辑保持不变) ────────────────
         if not args.token:
             if args.nn_parameter:
-                self.CLS      = nn.Parameter(torch.normal(0, 1, size=(1, d_llm))).to(device)
-                self.CLS_item = nn.Parameter(torch.normal(0, 1, size=(1, d_llm))).to(device)
+                self.CLS      = nn.Parameter(torch.normal(0, 1, size=(1, d_llm)))
+                self.CLS_item = nn.Parameter(torch.normal(0, 1, size=(1, d_llm)))
             else:
-                self.CLS = nn.Embedding(1, d_llm).to(device)
+                self.CLS = nn.Embedding(1, d_llm)
                 nn.init.normal_(self.CLS.weight,
                                  mean=emb_mean, std=emb_std)
-                self.CLS_item = nn.Embedding(1, d_llm).to(device)
+                self.CLS_item = nn.Embedding(1, d_llm)
                 nn.init.normal_(self.CLS_item.weight,
                                  mean=emb_mean, std=emb_std)
 
@@ -356,4 +356,4 @@ class llm4rec(nn.Module):
         match_loss += (self.uniformity(user_outputs_n) + self.uniformity(log_emb_n))
 
         loss = rec_loss + match_loss
-        return loss, rec_loss.item(), match_loss.item()
+        return loss, rec_loss.item(), match_loss.item(), user_outputs

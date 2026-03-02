@@ -6,17 +6,10 @@ seqllm_model.py  —— 在 LLM-SRec 基础上集成 Soft Prompt + 辅助任务
 差异化学习率：soft_prompts 用 1e-3，其余可训练参数用 1e-4
 """
 
-import random
 import pickle
 
-import torch
-from torch.cuda.amp import autocast as autocast
-import torch.nn as nn
-import numpy as np
-
 from models.recsys_model import *
-from models.seqllm4rec import *          # 已修改版
-from sentence_transformers import SentenceTransformer
+from models.seqllm4rec import *
 from datetime import datetime
 
 from tqdm import trange, tqdm
@@ -343,81 +336,44 @@ class llmrec_model(nn.Module):
         }
 
         # ── 主损失（含 soft prompts）──────────────────────
-        loss, rec_loss, match_loss = self.llm(samples, mode=0)
+        loss, rec_loss, match_loss, user_outputs  = self.llm(samples, mode=0)
 
         # ── 辅助任务：TA Loss ─────────────────────────────
-        # 需要拿到 user_outputs（128-d）重新计算避免 autograd 问题
-        # 简化版：复用 rec_loss 的 user_outputs；
-        # 这里用一次独立的前向抓取用户表示（不影响主损失图）
         if self.ta_loss_weight > 0 or self.rps_loss_weight > 0:
-            user_outputs_aux = self._get_user_outputs(samples)  # [B, 128]
 
             if self.ta_loss_weight > 0:
                 ta_loss = self._compute_ta_loss(
-                    user_outputs_aux.detach(), seq)
+                    user_outputs, seq)
                 loss = loss + self.ta_loss_weight * ta_loss
             else:
-                ta_loss = torch.tensor(0.0)
+                ta_loss = torch.tensor(0.0, device=loss.device)
 
             if self.rps_loss_weight > 0:
                 rps_loss = self._compute_rps_loss(
-                    user_outputs_aux.detach(), pos, seq)
+                    user_outputs, pos, seq)
                 loss = loss + self.rps_loss_weight * rps_loss
             else:
-                rps_loss = torch.tensor(0.0)
+                rps_loss = torch.tensor(0.0, device=loss.device)
         else:
-            ta_loss  = torch.tensor(0.0)
-            rps_loss = torch.tensor(0.0)
+            ta_loss  = torch.tensor(0.0, device=loss.device)
+            rps_loss = torch.tensor(0.0, device=loss.device)
 
         print(f"Epoch {epoch}/{total_epoch} step {step}/{total_step} | "
               f"rec={rec_loss:.4f} match={match_loss:.4f} "
               f"TA={ta_loss.item():.4f} RPS={rps_loss.item():.4f}")
 
         loss.backward()
+        if step % 1 == 0:
+            sp = self.llm.soft_prompts
+            grad_str = f"{sp.grad.norm().item():.6f}" if sp.grad is not None else "NO GRAD ❌"
+            print(f"[SP grad norm] {grad_str}")
+            print(f"[SP data norm] {sp.data.norm().item():.4f}")
+            print(f"[SP data std]  {sp.data.std().item():.6f}")
         if self.args.nn_parameter:
             htcore.mark_step()
         optimizer.step()
         if self.args.nn_parameter:
             htcore.mark_step()
-
-    def _get_user_outputs(self, samples):
-        """
-        从已有的 text_input / interact 中，以 no_grad=False 方式
-        抓取 user_outputs（用于辅助损失）。
-        注意：此函数会再次经历 soft_prompts 拼接，
-        梯度流向 soft_prompts / pred_user。
-        """
-        max_input_length = 1024
-        k = self.llm.num_soft_prompts
-
-        llm_tokens = self.llm.llm_tokenizer(
-            samples['text_input'],
-            return_tensors="pt", padding="longest",
-            truncation=True, max_length=max_input_length,
-        ).to(self.device)
-
-        inputs_embeds = self.llm.llm_model.get_input_embeddings()(
-            llm_tokens['input_ids'])
-
-        inputs_embeds = self.llm.replace_out_token_all(
-            llm_tokens, inputs_embeds,
-            token=['[UserOut]', '[HistoryEmb]'],
-            embs={'[HistoryEmb]': samples['interact']})
-
-        inputs_embeds, new_mask = self.llm._prepend_soft_prompts(
-            inputs_embeds, llm_tokens.get('attention_mask'))
-
-        with torch.amp.autocast('cuda'):
-            outputs = self.llm.llm_model.forward(
-                inputs_embeds=inputs_embeds,
-                attention_mask=new_mask,
-                output_hidden_states=True)
-            indx = self.llm.get_embeddings(llm_tokens, '[UserOut]', offset=k)
-            user_outputs = torch.cat([
-                outputs.hidden_states[-1][i, indx[i]].mean(axis=0).unsqueeze(0)
-                for i in range(len(indx))])
-
-        return self.llm.pred_user(user_outputs)   # [B, 128]
 
     def make_interact_text(self, interact_ids, interact_max_num, user):
         interact_item_titles_ = self.find_item_text(
