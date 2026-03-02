@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import prepare_model_for_kbit_training
+from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
 
 
 class llm4rec(nn.Module):
@@ -64,6 +64,16 @@ class llm4rec(nn.Module):
             emb_weight = self.llm_model.model.embed_tokens.weight
             emb_mean = emb_weight.mean().item()
             emb_std  = emb_weight.std().item()
+        if args.use_lora:
+            lora_config = LoraConfig(
+                r=getattr(args, 'lora_r', 8),
+                lora_alpha=getattr(args, 'lora_alpha', 16),
+                lora_dropout=getattr(args, 'lora_dropout', 0.05),
+                target_modules=["q_proj", "v_proj"],
+                bias="none",
+            )
+            self.llm_model = get_peft_model(self.llm_model, lora_config)
+            self.llm_model.print_trainable_parameters()
         self.soft_prompts = nn.Parameter(
             torch.normal(emb_mean, emb_std, size=(num_soft_prompts, d_llm))
         )  # shape: [k, d_llm]，requires_grad=True 默认

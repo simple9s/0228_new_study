@@ -43,6 +43,12 @@ if __name__ == "__main__":
     parser.add_argument('--rps_loss_weight',  default=0.3, type=float,
                         help='Weight for Recommendation Pattern Simulating loss. '
                              'Set 0 to disable.')
+
+    parser.add_argument('--use_lora', default=False, action='store_true')
+    parser.add_argument('--lora_r', default=8, type=int)
+    parser.add_argument('--lora_alpha', default=16, type=int)
+    parser.add_argument('--lora_dropout', default=0.05, type=float)
+    parser.add_argument('--lora_lr', default=5e-4, type=float)
     # ────────────────────────────────────────────────────────
 
     args = parser.parse_args()
