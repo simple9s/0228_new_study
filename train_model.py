@@ -29,6 +29,7 @@ def save_checkpoint(args, epoch, stage, model, optimizer, scheduler,
     create_dir(checkpoint_dir)
     path = os.path.join(checkpoint_dir,
                         f'{args.save_dir}_{args.rec_pre_trained_data}_stage{stage}_checkpoint.pth')
+    tmp_path = path + '.tmp'
     checkpoint = {
         'epoch': epoch, 'stage': stage,
         'model_state_dict': (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
@@ -40,7 +41,8 @@ def save_checkpoint(args, epoch, stage, model, optimizer, scheduler,
         'torch_random_state': torch.get_rng_state().cpu(),
         'cuda_random_state':  torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }
-    torch.save(checkpoint, path)
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, path)
     print(f"[Stage{stage}] Checkpoint saved at epoch {epoch}: {path}")
 
 
@@ -53,7 +55,11 @@ def load_checkpoint(args, stage, model, optimizer, scheduler,
         return None
     print(f"Loading Stage{stage} checkpoint from {path}")
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    (model.module if isinstance(model, DDP) else model).load_state_dict(ckpt['model_state_dict'])
+    result = (model.module if isinstance(model, DDP) else model).load_state_dict(ckpt['model_state_dict'], strict=False)
+    if result.missing_keys:
+        print(f"[load_checkpoint] missing keys: {result.missing_keys}")
+    if result.unexpected_keys:
+        print(f"[load_checkpoint] unexpected keys (ignored): {result.unexpected_keys}")
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
     scheduler.load_state_dict(ckpt['scheduler_state_dict'])
     random.setstate(ckpt['random_state'])
@@ -61,6 +67,9 @@ def load_checkpoint(args, stage, model, optimizer, scheduler,
     torch.set_rng_state(ckpt['torch_random_state'])
     if ckpt['cuda_random_state'] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(ckpt['cuda_random_state'])
+    print(f"Resumed from epoch {ckpt['epoch']}, "
+          f"best_perform={ckpt['best_perform']:.4f}, "
+          f"early_stop={ckpt['early_stop']}")
     return ckpt['epoch'] + 1, ckpt['best_perform'], ckpt['early_stop']
 
 
@@ -203,15 +212,15 @@ def train_model_(rank, world_size, args):
                   batch_iter=[epoch, args.num_epochs + 1, step, num_batch],
                   mode='phase2')
 
-            if step % (num_batch // 1) == 0 and step != 0:
-                _reset_metrics(model, args)
-                best_perform, early_stop = _run_validation(
-                    args, epoch, model, s2_optimizer, s2_scheduler,
-                    inference_data_loader, eval_set, user_valid, user_train,
-                    usernum, itemnum, best_perform, early_stop, early_thres, rank)
-                if early_stop == early_thres:
-                    sys.exit("Terminating Train")
-                model.train()
+            # if step % (num_batch // 1) == 0 and step != 0:
+            #     _reset_metrics(model, args)
+            #     best_perform, early_stop = _run_validation(
+            #         args, epoch, model, s2_optimizer, s2_scheduler,
+            #         inference_data_loader, eval_set, user_valid, user_train,
+            #         usernum, itemnum, best_perform, early_stop, early_thres, rank)
+            #     if early_stop == early_thres:
+            #         sys.exit("Terminating Train")
+            #     model.train()
 
         # epoch 末尾验证
         if rank == 0:
