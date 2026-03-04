@@ -110,12 +110,6 @@ class llm4rec(nn.Module):
         nn.init.xavier_normal_(self.pred_user_CF2[0].weight)
         nn.init.xavier_normal_(self.pred_user_CF2[3].weight)
 
-        self.cf_to_latent2 = nn.Sequential(
-            nn.Linear(64, 128), nn.LayerNorm(128),
-            nn.GELU(), nn.Linear(128, 128))
-        nn.init.xavier_normal_(self.cf_to_latent2[0].weight)
-        nn.init.xavier_normal_(self.cf_to_latent2[3].weight)
-
         # ── 辅助任务预测头 ────────────────────────────────
         # TA head: 给定上下文，从 user_output 预测下一个 item（128-d 空间）
         # RPS head: 将 user_output 映射到 CF 空间做对齐
