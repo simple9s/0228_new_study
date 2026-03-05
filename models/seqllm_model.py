@@ -116,11 +116,15 @@ class llmrec_model(nn.Module):
             params, lr=getattr(self.args, 'stage1_lr', 1e-3), betas=(0.9, 0.98))
 
     def build_optimizer_stage2(self):
-        # Stage 1 的两组软提示完全冻结，不参与 Stage 2 forward
+        # Stage 1 的所有参数完全冻结，不参与 Stage 2
         self.llm.soft_prompts_ta.requires_grad  = False
         self.llm.soft_prompts_rps.requires_grad = False
-        self.log_var_ta.requires_grad  = False
-        self.log_var_rps.requires_grad = False
+        self.log_var_ta.requires_grad            = False
+        self.log_var_rps.requires_grad           = False
+        for p in self.llm.pred_user_ta.parameters():
+            p.requires_grad = False
+        for p in self.llm.pred_user_rps.parameters():
+            p.requires_grad = False
         # Stage 2 专用软提示解冻，对齐 DELRec LSR template
         self.llm.soft_prompts_lsr.requires_grad = True
         lora_params, other_params = [], []
