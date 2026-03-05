@@ -57,11 +57,11 @@ class llm4rec(nn.Module):
             else:
                 param.requires_grad = False
 
-        # ── 两组独立 Soft Prompts ─────────────────────────
-        # soft_prompts_ta  : 专门用于 Temporal Analysis 任务
-        # soft_prompts_rps : 专门用于 Recommendation Pattern Simulating 任务
-        # 两组独立学习各自任务的推荐模式，与 DELRec 原版设计对齐
-        # DELRec 原版每组 duplicate=100，建议 num_soft_prompts 设为 50~100
+        # ── Soft Prompts ──────────────────────────────────
+        # soft_prompts     : 阶段一 TA+RPS 两任务共享同一组，联合优化
+        #                    对齐 DELRec：两任务梯度累积在同一组参数上
+        # soft_prompts_lsr : 阶段二专用，阶段一结束后从 soft_prompts 热启动后冻结
+        #                    对齐 DELRec 阶段二 load_state_dict 机制
         d_llm = self.llm_model.config.hidden_size
         with torch.no_grad():
             emb_weight = self.llm_model.model.embed_tokens.weight
@@ -79,16 +79,15 @@ class llm4rec(nn.Module):
             self.llm_model = get_peft_model(self.llm_model, lora_config)
             self.llm_model.print_trainable_parameters()
 
-        # TA 任务软提示：学习时序分析模式（关注序列时间规律）
-        self.soft_prompts_ta = nn.Parameter(
+        # 阶段一共享软提示（TA + RPS 联合优化同一组参数，对齐 DELRec）
+        self.soft_prompts = nn.Parameter(
             torch.normal(emb_mean, emb_std, size=(num_soft_prompts, d_llm))
         )  # shape: [k, d_llm]
 
-        # RPS 任务软提示：学习 SR 模型推荐行为模式（对齐 SASRec 输出）
-        # Stage 2 复用此组 prompt（冻结），与 DELRec 原版设计对齐：
-        # Stage 1 学到的推荐模式知识通过 frozen prompt 传递给 Stage 2
-        self.soft_prompts_rps = nn.Parameter(
-            torch.normal(emb_mean, emb_std, size=(num_soft_prompts, d_llm))
+        # 阶段二软提示（阶段一结束后从 soft_prompts 热启动，冻结不更新）
+        self.soft_prompts_lsr = nn.Parameter(
+            torch.normal(emb_mean, emb_std, size=(num_soft_prompts, d_llm)),
+            requires_grad=False
         )  # shape: [k, d_llm]
 
         # ── CLS tokens（原有逻辑保持不变）────────────────
@@ -141,14 +140,14 @@ class llm4rec(nn.Module):
 
     # ─────────────────────────────────────────────────────────────
     # _prepend_soft_prompts
-    #   task='ta'  → 使用 soft_prompts_ta（Stage 1 TA 任务）
-    #   task='rps' → 使用 soft_prompts_rps（Stage 1 RPS 任务 / Stage 2 复用）
+    #   task='stage1' → 使用 soft_prompts（阶段一 TA+RPS 共享）
+    #   task='stage2' → 使用 soft_prompts_lsr（阶段二专用，冻结）
     # ─────────────────────────────────────────────────────────────
-    def _prepend_soft_prompts(self, inputs_embeds, attention_mask=None, task='ta'):
+    def _prepend_soft_prompts(self, inputs_embeds, attention_mask=None, task='stage1'):
         """
         inputs_embeds : [B, T, d]
         attention_mask: [B, T] or None
-        task          : 'ta' | 'rps'
+        task          : 'stage1' | 'stage2'
         返回:
             new_embeds : [B, k+T, d]
             new_mask   : [B, k+T] or None
@@ -156,12 +155,10 @@ class llm4rec(nn.Module):
         B = inputs_embeds.shape[0]
         k = self.num_soft_prompts
 
-        # Stage 2 复用 soft_prompts_rps（已冻结），传递 Stage 1 的推荐模式知识
-        if task == 'rps':
-            sp = self.soft_prompts_rps
+        if task == 'stage2':
+            sp = self.soft_prompts_lsr   # 冻结，阶段一热启动
         else:
-            # 'ta' 默认
-            sp = self.soft_prompts_ta
+            sp = self.soft_prompts       # 阶段一 TA+RPS 共享
 
         # [k, d] → [1, k, d] → [B, k, d]，cast 到相同 dtype
         sp = sp.unsqueeze(0).expand(B, -1, -1).to(inputs_embeds.dtype)
@@ -291,7 +288,7 @@ class llm4rec(nn.Module):
         return token_idx
 
     # ─────────────────────────────────────────────────────────────
-    # forward（Stage 2 走 train_mode0，task='rps' 复用 soft_prompts_rps）
+    # forward（Stage 2 走 train_mode0，task='stage2' 使用 soft_prompts_lsr）
     # ─────────────────────────────────────────────────────────────
     def forward(self, samples, mode=0):
         if mode == 0:
@@ -302,9 +299,9 @@ class llm4rec(nn.Module):
     def train_mode0(self, samples):
         """
         Stage 2 主训练 forward。
-        soft_prompts_ta / soft_prompts_rps 在此阶段均已冻结。
-        Stage 2 复用 task='rps'（soft_prompts_rps），将 Stage 1 学到的
-        推荐模式知识作为固定底座传入 LLM，对齐 DELRec 原版设计。
+        soft_prompts（阶段一共享）已冻结，soft_prompts_lsr（阶段二专用）已冻结。
+        Stage 2 使用 task='stage2'（soft_prompts_lsr，由 soft_prompts 热启动后冻结），
+        对齐 DELRec 阶段二设计。
         """
         max_input_length = 1024 + self.num_soft_prompts
         k = self.num_soft_prompts
@@ -323,9 +320,9 @@ class llm4rec(nn.Module):
             token=['[UserOut]', '[HistoryEmb]'],
             embs={'[HistoryEmb]': samples['interact']})
 
-        # Stage 2 复用 soft_prompts_rps（冻结），传递 Stage 1 推荐模式知识
+        # Stage 2 使用 soft_prompts_lsr（由 soft_prompts 热启动后冻结，对齐 DELRec）
         inputs_embeds, new_mask = self._prepend_soft_prompts(
-            inputs_embeds, llm_tokens.get('attention_mask'), task='rps')
+            inputs_embeds, llm_tokens.get('attention_mask'), task='stage2')
 
         # ── 候选分支：分 chunk 推理，显存峰值与 candidate_num 解耦 ─────────────
         # 候选 forward 不需要梯度（item embedding 只用于点积打分），
@@ -358,7 +355,7 @@ class llm4rec(nn.Module):
                     token=['[ItemOut]', '[HistoryEmb]'],
                     embs={'[HistoryEmb]': chunk_embs})
                 c_embeds, c_mask = self._prepend_soft_prompts(
-                    c_embeds, c_tokens.get('attention_mask'), task='rps')
+                    c_embeds, c_tokens.get('attention_mask'), task='stage2')
 
                 with torch.amp.autocast('cuda'):
                     c_out = self.llm_model.forward(
@@ -399,7 +396,6 @@ class llm4rec(nn.Module):
         B = user_outputs.shape[0]
         candidate_num   = item_outputs.shape[0] // B
         item_outputs_3d = item_outputs.view(B, candidate_num, -1)      # [B, C, 128]
-        item_outputs_3d = item_outputs_3d.to(user_outputs.dtype)
         lsr_logits      = torch.bmm(item_outputs_3d,
                                     user_outputs.unsqueeze(2)).squeeze(2)  # [B, C]
         lsr_labels = torch.zeros(B, dtype=torch.long, device=lsr_logits.device)

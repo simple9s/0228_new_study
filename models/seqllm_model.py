@@ -1,6 +1,6 @@
 """
 seqllm_model.py  —— 两阶段 DELRec 实现
-Stage 1: 只训练 soft_prompts_ta + soft_prompts_rps，用 TA + RPS loss
+Stage 1: 训练 soft_prompts（TA+RPS 共享），用 TA + RPS loss
          MTL 权重：可学习不确定性权重（Uncertainty Weighting），对齐 DELRec MTL.py log_var 设计
          避免使用 torch.autograd.grad()（与 LLM gradient checkpointing 不兼容）
 Stage 2: 冻结两组 soft_prompts，训练 rec + match loss
@@ -99,11 +99,10 @@ class llmrec_model(nn.Module):
 
     # ── 优化器 ────────────────────────────────────────────────────────────────
     def build_optimizer_stage1(self):
-        self.llm.soft_prompts_ta.requires_grad  = True
-        self.llm.soft_prompts_rps.requires_grad = True
+        self.llm.soft_prompts.requires_grad     = True
+        self.llm.soft_prompts_lsr.requires_grad = False  # 阶段一不训练 lsr
         params = (
-            [self.llm.soft_prompts_ta,
-             self.llm.soft_prompts_rps,
+            [self.llm.soft_prompts,
              self.log_var_ta,
              self.log_var_rps]
             + list(self.llm.pred_user_ta.parameters())
@@ -115,19 +114,20 @@ class llmrec_model(nn.Module):
             params, lr=getattr(self.args, 'stage1_lr', 1e-3), betas=(0.9, 0.98))
 
     def build_optimizer_stage2(self):
-        # Stage 1 的所有参数完全冻结，不参与 Stage 2
-        self.llm.soft_prompts_ta.requires_grad  = False
-        self.llm.soft_prompts_rps.requires_grad = False  # Stage 2 复用为 frozen prompt
-        self.log_var_ta.requires_grad            = False
-        self.log_var_rps.requires_grad           = False
+        # 阶段一成果全部冻结
+        self.llm.soft_prompts.requires_grad  = False
+        self.log_var_ta.requires_grad        = False
+        self.log_var_rps.requires_grad       = False
         for p in self.llm.pred_user_ta.parameters():
             p.requires_grad = False
         for p in self.llm.pred_user_rps.parameters():
             p.requires_grad = False
-        # item_emb_proj 是 Stage 1 的成果，Stage 2 冻结，防止打乱 item 表示空间
         for p in self.item_emb_proj.parameters():
             p.requires_grad = False
-        # pred_item：Stage 1 已训练，Stage 2 继续通过 lsr_loss 更新
+        # soft_prompts_lsr：用阶段一 soft_prompts 热启动后冻结，对齐 DELRec
+        self.llm.soft_prompts_lsr.data = self.llm.soft_prompts.data.clone()
+        self.llm.soft_prompts_lsr.requires_grad = False
+        # pred_item：阶段二继续通过 lsr_loss 更新
         for p in self.llm.pred_item.parameters():
             p.requires_grad = True
         lora_params, other_params = [], []
@@ -240,7 +240,8 @@ class llmrec_model(nn.Module):
         rps_loss = torch.tensor(0.0, device=self.device)
 
         if self.ta_loss_weight > 0:
-            ta_sp     = self.llm.soft_prompts_ta.unsqueeze(0).expand(B, -1, -1).to(base_embeds.dtype)
+            # TA 和 RPS 共享同一组 soft_prompts，对齐 DELRec
+            ta_sp     = self.llm.soft_prompts.unsqueeze(0).expand(B, -1, -1).to(base_embeds.dtype)
             ta_embeds = torch.cat([ta_sp, base_embeds], dim=1)
 
             with torch.amp.autocast('cuda'):
@@ -260,7 +261,7 @@ class llmrec_model(nn.Module):
             del ta_out, ta_embeds, user_hidden_ta, user_outputs_ta, ta_weighted
 
         if self.rps_loss_weight > 0:
-            rps_sp     = self.llm.soft_prompts_rps.unsqueeze(0).expand(B, -1, -1).to(base_embeds.dtype)
+            rps_sp     = self.llm.soft_prompts.unsqueeze(0).expand(B, -1, -1).to(base_embeds.dtype)
             rps_embeds = torch.cat([rps_sp, base_embeds], dim=1)
 
             with torch.amp.autocast('cuda'):
@@ -372,8 +373,8 @@ class llmrec_model(nn.Module):
             torch.save(self.llm.pred_user_ta.state_dict(),     out_dir + 'pred_user_ta.pt')
             torch.save(self.llm.pred_user_rps.state_dict(),    out_dir + 'pred_user_rps.pt')
             torch.save(self.llm.pred_item.state_dict(),        out_dir + 'pred_item.pt')
-            torch.save(self.llm.soft_prompts_ta.data,          out_dir + 'soft_prompts_ta.pt')
-            torch.save(self.llm.soft_prompts_rps.data,         out_dir + 'soft_prompts_rps.pt')
+            torch.save(self.llm.soft_prompts.data,            out_dir + 'soft_prompts.pt')
+            torch.save(self.llm.soft_prompts_lsr.data,         out_dir + 'soft_prompts_lsr.pt')
             torch.save(self.log_var_ta.data,                   out_dir + 'log_var_ta.pt')
             torch.save(self.log_var_rps.data,                  out_dir + 'log_var_rps.pt')
             if not args.token:
@@ -403,18 +404,12 @@ class llmrec_model(nn.Module):
                     torch.load(p, map_location=self.device))
         self.llm.pred_item.load_state_dict(
             torch.load(out_dir + 'pred_item.pt', map_location=self.device))
-        # 两组软提示，兼容旧版单组 soft_prompts.pt
-        ta_path     = out_dir + 'soft_prompts_ta.pt'
-        rps_path    = out_dir + 'soft_prompts_rps.pt'
-        legacy_path = out_dir + 'soft_prompts.pt'
-        if os.path.exists(ta_path):
-            self.llm.soft_prompts_ta.data  = torch.load(ta_path,  map_location=self.device)
-        elif os.path.exists(legacy_path):
-            legacy = torch.load(legacy_path, map_location=self.device)
-            self.llm.soft_prompts_ta.data  = legacy.clone()
-            self.llm.soft_prompts_rps.data = legacy.clone()
-        if os.path.exists(rps_path):
-            self.llm.soft_prompts_rps.data = torch.load(rps_path, map_location=self.device)
+        sp_path     = out_dir + 'soft_prompts.pt'
+        lsr_path    = out_dir + 'soft_prompts_lsr.pt'
+        if os.path.exists(sp_path):
+            self.llm.soft_prompts.data = torch.load(sp_path, map_location=self.device)
+        if os.path.exists(lsr_path):
+            self.llm.soft_prompts_lsr.data = torch.load(lsr_path, map_location=self.device)
         for attr, fname in [('log_var_ta', 'log_var_ta.pt'), ('log_var_rps', 'log_var_rps.pt')]:
             p = out_dir + fname
             if os.path.exists(p):
@@ -527,7 +522,7 @@ class llmrec_model(nn.Module):
                         candi_tokens, candi_embeds, token=['[ItemOut]', '[HistoryEmb]'],
                         embs={'[HistoryEmb]': candidate_embs[0]})
                     candi_embeds, candi_mask = self.llm._prepend_soft_prompts(
-                        candi_embeds, candi_tokens.get('attention_mask'), task='rps')
+                        candi_embeds, candi_tokens.get('attention_mask'), task='stage2')
                     with torch.amp.autocast('cuda'):
                         # .model 跳过 lm_head，不产生 vocab logits，省掉约 10 GB 显存
                         candi_outputs = self.llm.llm_model.model.forward(
@@ -571,7 +566,7 @@ class llmrec_model(nn.Module):
                 llm_tokens, inputs_embeds, token=['[UserOut]', '[HistoryEmb]'],
                 embs={'[HistoryEmb]': interact_embs})
             inputs_embeds, new_mask = self.llm._prepend_soft_prompts(
-                inputs_embeds, llm_tokens.get('attention_mask'), task='rps')
+                inputs_embeds, llm_tokens.get('attention_mask'), task='stage2')
             with torch.amp.autocast('cuda'):
                 # .model 跳过 lm_head，不产生 vocab logits
                 outputs = self.llm.llm_model.model.forward(
@@ -613,7 +608,7 @@ class llmrec_model(nn.Module):
                 llm_tokens, inputs_embeds, token=['[UserOut]', '[HistoryEmb]'],
                 embs={'[HistoryEmb]': interact_embs})
             inputs_embeds, new_mask = self.llm._prepend_soft_prompts(
-                inputs_embeds, llm_tokens.get('attention_mask'), task='rps')
+                inputs_embeds, llm_tokens.get('attention_mask'), task='stage2')
             with torch.amp.autocast('cuda'):
                 # .model 跳过 lm_head，不产生 vocab logits
                 outputs = self.llm.llm_model.model.forward(
