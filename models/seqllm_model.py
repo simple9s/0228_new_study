@@ -101,10 +101,22 @@ class llmrec_model(nn.Module):
             params, lr=getattr(self.args, 'stage1_lr', 1e-3), betas=(0.9, 0.98))
 
     def build_optimizer_stage2(self):
-        """Stage 2：冻结 soft_prompts，其余可训练参数用 stage2_lr"""
         self.llm.soft_prompts.requires_grad = False
-        other_params = [p for p in self.parameters() if p.requires_grad]
-        return torch.optim.Adam(other_params, lr=self.args.stage2_lr, betas=(0.9, 0.98))
+
+        lora_params, other_params = [], []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if 'lora_' in name:
+                lora_params.append(p)
+            else:
+                other_params.append(p)
+
+        param_groups = [
+            {'params': other_params, 'lr': self.args.stage2_lr},
+            {'params': lora_params, 'lr': getattr(self.args, 'lora_lr', self.args.stage2_lr)},
+        ]
+        return torch.optim.Adam(param_groups, betas=(0.9, 0.98))
 
     def _compute_ta_loss_128(self, user_outputs, seq_batch):
         ta_losses = []
