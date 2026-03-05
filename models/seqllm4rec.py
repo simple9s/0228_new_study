@@ -85,13 +85,9 @@ class llm4rec(nn.Module):
         )  # shape: [k, d_llm]
 
         # RPS 任务软提示：学习 SR 模型推荐行为模式（对齐 SASRec 输出）
+        # Stage 2 复用此组 prompt（冻结），与 DELRec 原版设计对齐：
+        # Stage 1 学到的推荐模式知识通过 frozen prompt 传递给 Stage 2
         self.soft_prompts_rps = nn.Parameter(
-            torch.normal(emb_mean, emb_std, size=(num_soft_prompts, d_llm))
-        )  # shape: [k, d_llm]
-
-        # LSR 任务软提示：Stage 2 专用，全新初始化，对齐 DELRec LSR template
-        # Stage 1 的 ta/rps 两组在 Stage 2 完全冻结且不参与 forward
-        self.soft_prompts_lsr = nn.Parameter(
             torch.normal(emb_mean, emb_std, size=(num_soft_prompts, d_llm))
         )  # shape: [k, d_llm]
 
@@ -144,16 +140,15 @@ class llm4rec(nn.Module):
         self.max_output_txt_len = max_output_txt_len
 
     # ─────────────────────────────────────────────────────────────
-    # 核心改动：_prepend_soft_prompts 增加 task 参数
-    #   task='ta'  → 使用 soft_prompts_ta
-    #   task='rps' → 使用 soft_prompts_rps
-    #   task='lsr'    → 使用 soft_prompts_lsr（Stage 2 专用，对齐 DELRec LSR template）
+    # _prepend_soft_prompts
+    #   task='ta'  → 使用 soft_prompts_ta（Stage 1 TA 任务）
+    #   task='rps' → 使用 soft_prompts_rps（Stage 1 RPS 任务 / Stage 2 复用）
     # ─────────────────────────────────────────────────────────────
     def _prepend_soft_prompts(self, inputs_embeds, attention_mask=None, task='ta'):
         """
         inputs_embeds : [B, T, d]
         attention_mask: [B, T] or None
-        task          : 'ta' | 'rps' | 'lsr'
+        task          : 'ta' | 'rps'
         返回:
             new_embeds : [B, k+T, d]
             new_mask   : [B, k+T] or None
@@ -161,11 +156,9 @@ class llm4rec(nn.Module):
         B = inputs_embeds.shape[0]
         k = self.num_soft_prompts
 
-        # 根据任务选择对应的软提示组
+        # Stage 2 复用 soft_prompts_rps（已冻结），传递 Stage 1 的推荐模式知识
         if task == 'rps':
             sp = self.soft_prompts_rps
-        elif task == 'lsr':
-            sp = self.soft_prompts_lsr
         else:
             # 'ta' 默认
             sp = self.soft_prompts_ta
@@ -298,7 +291,7 @@ class llm4rec(nn.Module):
         return token_idx
 
     # ─────────────────────────────────────────────────────────────
-    # forward（Stage 2 走 train_mode0，task='lsr' 使用 soft_prompts_lsr）
+    # forward（Stage 2 走 train_mode0，task='rps' 复用 soft_prompts_rps）
     # ─────────────────────────────────────────────────────────────
     def forward(self, samples, mode=0):
         if mode == 0:
@@ -309,8 +302,9 @@ class llm4rec(nn.Module):
     def train_mode0(self, samples):
         """
         Stage 2 主训练 forward。
-        soft_prompts_ta / soft_prompts_rps 在此阶段均已冻结，
-        统一使用 task='lsr'（soft_prompts_lsr，Stage 2 专用可学习软提示）。
+        soft_prompts_ta / soft_prompts_rps 在此阶段均已冻结。
+        Stage 2 复用 task='rps'（soft_prompts_rps），将 Stage 1 学到的
+        推荐模式知识作为固定底座传入 LLM，对齐 DELRec 原版设计。
         """
         max_input_length = 1024 + self.num_soft_prompts
         k = self.num_soft_prompts
@@ -329,56 +323,98 @@ class llm4rec(nn.Module):
             token=['[UserOut]', '[HistoryEmb]'],
             embs={'[HistoryEmb]': samples['interact']})
 
-        # Stage 2：task='lsr'，使用 soft_prompts_lsr（可学习，对齐 DELRec LSR template）
+        # Stage 2 复用 soft_prompts_rps（冻结），传递 Stage 1 推荐模式知识
         inputs_embeds, new_mask = self._prepend_soft_prompts(
-            inputs_embeds, llm_tokens.get('attention_mask'), task='lsr')
+            inputs_embeds, llm_tokens.get('attention_mask'), task='rps')
 
-        candi_tokens = self.llm_tokenizer(
-            samples['candidates_pos'],
-            return_tensors="pt", padding="longest",
-            truncation=True, max_length=max_input_length,
-        ).to(self.device)
-        candi_embeds = self.llm_model.get_input_embeddings()(candi_tokens['input_ids'])
-        candi_embeds = self.replace_out_token_all_infer(
-            candi_tokens, candi_embeds,
-            token=['[ItemOut]', '[HistoryEmb]'],
-            embs={'[HistoryEmb]': samples['candidate_embs']})
+        # ── 候选分支：分 chunk 推理，显存峰值与 candidate_num 解耦 ─────────────
+        # 候选 forward 不需要梯度（item embedding 只用于点积打分），
+        # 按 candi_chunk_size 切片逐批过 LLM，最后 cat 成 [B*C, 128]。
+        # 这样峰值显存只取决于 chunk 大小，而非 B*C 总量。
+        candi_chunk_size = getattr(self.args, 'candi_chunk_size', 4)
+        all_candidates   = samples['candidates_pos']      # list, len = B*C
+        all_candi_embs   = samples['candidate_embs']      # [B*C, rec_dim]
+        item_outputs_list = []
 
-        # 候选分支同样用 soft_prompts_lsr
-        candi_embeds, candi_mask = self._prepend_soft_prompts(
-            candi_embeds, candi_tokens.get('attention_mask'), task='lsr')
+        # 候选分支：LLM forward 在 no_grad 内（节省显存），
+        # pred_item 移到 no_grad 外面，保证其参数能收到梯度。
+        # 注意：item_hidden 用 detach() 截断 LLM 侧梯度，
+        # 梯度只流经 pred_item，不回传到 LLM，这与 Stage1 的 item 编码器设计一致。
+        item_hidden_list = []
+        with torch.no_grad():
+            for chunk_start in range(0, len(all_candidates), candi_chunk_size):
+                chunk_end   = chunk_start + candi_chunk_size
+                chunk_texts = all_candidates[chunk_start:chunk_end]
+                chunk_embs  = all_candi_embs[chunk_start:chunk_end]
 
+                c_tokens = self.llm_tokenizer(
+                    chunk_texts,
+                    return_tensors="pt", padding="longest",
+                    truncation=True, max_length=max_input_length,
+                ).to(self.device)
+                c_embeds = self.llm_model.get_input_embeddings()(c_tokens['input_ids'])
+                c_embeds = self.replace_out_token_all_infer(
+                    c_tokens, c_embeds,
+                    token=['[ItemOut]', '[HistoryEmb]'],
+                    embs={'[HistoryEmb]': chunk_embs})
+                c_embeds, c_mask = self._prepend_soft_prompts(
+                    c_embeds, c_tokens.get('attention_mask'), task='rps')
+
+                with torch.amp.autocast('cuda'):
+                    c_out = self.llm_model.forward(
+                        inputs_embeds=c_embeds,
+                        attention_mask=c_mask,
+                        output_hidden_states=True)
+                    c_indx = self.get_embeddings(c_tokens, '[ItemOut]', offset=k)
+                    chunk_hidden = torch.cat([
+                        c_out.hidden_states[-1][i, c_indx[i]].mean(axis=0).unsqueeze(0)
+                        for i in range(len(c_indx))])
+
+                # 只保存 LLM 隐藏态，detach 截断 LLM 梯度
+                item_hidden_list.append(chunk_hidden.detach().float())
+                del c_out, c_embeds, c_mask, chunk_hidden
+
+        # pred_item 在 no_grad 外：参数可以正常收到来自 lsr_loss 的梯度
+        item_hidden = torch.cat(item_hidden_list, dim=0)   # [B*C, d_llm]
         with torch.amp.autocast('cuda'):
-            candi_outputs = self.llm_model.forward(
-                inputs_embeds=candi_embeds,
-                attention_mask=candi_mask,
-                output_hidden_states=True)
-            indx = self.get_embeddings(candi_tokens, '[ItemOut]', offset=k)
-            item_outputs = torch.cat([
-                candi_outputs.hidden_states[-1][i, indx[i]].mean(axis=0).unsqueeze(0)
-                for i in range(len(indx))])
+            item_outputs = self.pred_item(item_hidden)     # [B*C, 128]，有梯度
 
+        # ── 用户分支：需要梯度，正常 forward ────────────────────────────────────
+        with torch.amp.autocast('cuda'):
             outputs = self.llm_model.forward(
                 inputs_embeds=inputs_embeds,
                 attention_mask=new_mask,
                 output_hidden_states=True)
             indx = self.get_embeddings(llm_tokens, '[UserOut]', offset=k)
-            user_outputs = torch.cat([
+            user_hidden = torch.cat([
                 outputs.hidden_states[-1][i, indx[i]].mean(axis=0).unsqueeze(0)
                 for i in range(len(indx))])
 
-        user_outputs = self.pred_user(user_outputs)
-        item_outputs = self.pred_item(item_outputs)
+        user_outputs = self.pred_user(user_hidden.float())  # [B, 128]，有梯度
 
-        rec_loss = self.rec_loss(user_outputs, item_outputs)
+        # ── lsr_loss：候选集分类，对齐 DELRec 原版 Stage 2 ───────────────────
+        # rec_loss 与 lsr_loss 本质相同（同样的 user/item，同样的点积 CE），
+        # 保留 lsr_loss 作为唯一的排序监督信号，避免梯度重复叠加。
+        # 正样本 index=0（make_candidate_text 中 target 固定排第一位）。
+        B = user_outputs.shape[0]
+        candidate_num   = item_outputs.shape[0] // B
+        item_outputs_3d = item_outputs.view(B, candidate_num, -1)      # [B, C, 128]
+        item_outputs_3d = item_outputs_3d.to(user_outputs.dtype)
+        lsr_logits      = torch.bmm(item_outputs_3d,
+                                    user_outputs.unsqueeze(2)).squeeze(2)  # [B, C]
+        lsr_labels = torch.zeros(B, dtype=torch.long, device=lsr_logits.device)
+        lsr_loss   = F.cross_entropy(lsr_logits, lsr_labels)
 
+        # ── match_loss：对齐 SASRec log_emb（结果蒸馏）───────────────────────
         log_emb = self.pred_user_CF2(log_emb)
-
         user_outputs_n = F.normalize(user_outputs, p=2, dim=1)
         log_emb_n      = F.normalize(log_emb,      p=2, dim=1)
-
-        match_loss = self.mse(user_outputs_n, log_emb_n)
+        match_loss  = self.mse(user_outputs_n, log_emb_n)
         match_loss += (self.uniformity(user_outputs_n) + self.uniformity(log_emb_n))
 
-        loss = rec_loss + match_loss
-        return loss, rec_loss.item(), match_loss.item(), user_outputs
+        # ── 两路 loss 合并 ────────────────────────────────────────────────────
+        # lsr_loss  : 候选集分类，覆盖排序监督（替代原 rec_loss，避免梯度重复）
+        # match_loss: MSE 对齐 SASRec log_emb + uniformity 防退化（结果蒸馏）
+        lsr_weight = getattr(self.args, 'lsr_loss_weight', 0.5)
+        loss = lsr_weight * lsr_loss + match_loss
+        return loss, lsr_loss.item(), match_loss.item(), user_outputs

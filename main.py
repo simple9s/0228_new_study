@@ -49,6 +49,10 @@ if __name__ == "__main__":
     parser.add_argument('--stage1_lr', default=1e-3, type=float,
                         help='Stage 1 soft_prompts 学习率')
 
+    parser.add_argument('--lsr_loss_weight',   default=0.5, type=float,
+                        help='Weight for LSR classification loss. '
+                             'Set 0 to disable (falls back to match_loss only).')
+
     parser.add_argument('--use_lora', default=False, action='store_true')
     parser.add_argument('--lora_r', default=8, type=int)
     parser.add_argument('--lora_alpha', default=16, type=int)

@@ -101,7 +101,6 @@ class llmrec_model(nn.Module):
     def build_optimizer_stage1(self):
         self.llm.soft_prompts_ta.requires_grad  = True
         self.llm.soft_prompts_rps.requires_grad = True
-        self.llm.soft_prompts_lsr.requires_grad = False  # Stage 1 不训练 LSR 软提示
         params = (
             [self.llm.soft_prompts_ta,
              self.llm.soft_prompts_rps,
@@ -118,15 +117,19 @@ class llmrec_model(nn.Module):
     def build_optimizer_stage2(self):
         # Stage 1 的所有参数完全冻结，不参与 Stage 2
         self.llm.soft_prompts_ta.requires_grad  = False
-        self.llm.soft_prompts_rps.requires_grad = False
+        self.llm.soft_prompts_rps.requires_grad = False  # Stage 2 复用为 frozen prompt
         self.log_var_ta.requires_grad            = False
         self.log_var_rps.requires_grad           = False
         for p in self.llm.pred_user_ta.parameters():
             p.requires_grad = False
         for p in self.llm.pred_user_rps.parameters():
             p.requires_grad = False
-        # Stage 2 专用软提示解冻，对齐 DELRec LSR template
-        self.llm.soft_prompts_lsr.requires_grad = True
+        # item_emb_proj 是 Stage 1 的成果，Stage 2 冻结，防止打乱 item 表示空间
+        for p in self.item_emb_proj.parameters():
+            p.requires_grad = False
+        # pred_item：Stage 1 已训练，Stage 2 继续通过 lsr_loss 更新
+        for p in self.llm.pred_item.parameters():
+            p.requires_grad = True
         lora_params, other_params = [], []
         for name, p in self.named_parameters():
             if not p.requires_grad:
@@ -295,6 +298,8 @@ class llmrec_model(nn.Module):
         with torch.no_grad():
             log_emb = self.recsys.model(u, seq, pos, neg, mode='log_only')
 
+        # candidate_num 保持 4，不增加显存压力
+        # lsr_loss 在此小候选集上做分类，已足够提供排序监督信号
         for i in range(len(u)):
             target_item_id    = pos[i][-1]
             target_item_title = self.find_item_text_single(target_item_id, title_flag=True, description_flag=False)
@@ -307,9 +312,12 @@ class llmrec_model(nn.Module):
                                + '. Based on this sequence of purchases, '
                                  'generate user representation token:[UserOut]')
             candidates_pos += candidate_text
-            interact_embs.append(self.item_emb_proj(self.get_item_emb(interact_ids)))
-            candidate_embs.append(
-                self.item_emb_proj(self.get_item_emb([candidate_ids])).squeeze(0))
+            # item_emb_proj 在 Stage 2 被冻结，用 no_grad 明确截断梯度，
+            # 防止 Stage 2 的 loss 回传破坏 Stage 1 建立的 item 表示空间
+            with torch.no_grad():
+                interact_embs.append(self.item_emb_proj(self.get_item_emb(interact_ids)))
+                candidate_embs.append(
+                    self.item_emb_proj(self.get_item_emb([candidate_ids])).squeeze(0))
 
         samples = {
             'text_input':     text_input,
@@ -319,10 +327,10 @@ class llmrec_model(nn.Module):
             'candidate_embs': torch.cat(candidate_embs),
         }
 
-        loss, rec_loss, match_loss, _ = self.llm(samples, mode=0)
+        loss, lsr_loss, match_loss, _ = self.llm(samples, mode=0)
 
         print(f"[Stage2] Epoch {epoch}/{total_epoch} step {step}/{total_step} | "
-              f"rec={rec_loss:.4f} match={match_loss:.4f}")
+              f"lsr={lsr_loss:.4f} match={match_loss:.4f}")
 
         loss.backward()
         if self.args.nn_parameter:
@@ -366,7 +374,6 @@ class llmrec_model(nn.Module):
             torch.save(self.llm.pred_item.state_dict(),        out_dir + 'pred_item.pt')
             torch.save(self.llm.soft_prompts_ta.data,          out_dir + 'soft_prompts_ta.pt')
             torch.save(self.llm.soft_prompts_rps.data,         out_dir + 'soft_prompts_rps.pt')
-            torch.save(self.llm.soft_prompts_lsr.data,         out_dir + 'soft_prompts_lsr.pt')
             torch.save(self.log_var_ta.data,                   out_dir + 'log_var_ta.pt')
             torch.save(self.log_var_rps.data,                  out_dir + 'log_var_rps.pt')
             if not args.token:
@@ -408,9 +415,6 @@ class llmrec_model(nn.Module):
             self.llm.soft_prompts_rps.data = legacy.clone()
         if os.path.exists(rps_path):
             self.llm.soft_prompts_rps.data = torch.load(rps_path, map_location=self.device)
-        lsr_path = out_dir + 'soft_prompts_lsr.pt'
-        if os.path.exists(lsr_path):
-            self.llm.soft_prompts_lsr.data = torch.load(lsr_path, map_location=self.device)
         for attr, fname in [('log_var_ta', 'log_var_ta.pt'), ('log_var_rps', 'log_var_rps.pt')]:
             p = out_dir + fname
             if os.path.exists(p):
@@ -505,7 +509,7 @@ class llmrec_model(nn.Module):
                       else 64 if (self.args.llm == 'llama' or self.args.rec_pre_trained_data in ('Electronics', 'Books'))
                       else 128)
             batches = self.split_into_batches(self.item_num, batch_)
-            self.all_embs = []
+            all_embs_list = []   # 局部变量，不挂在 self 上，cat 后立即释放
             for bat in tqdm(batches):
                 candidate_text, candidate_ids, candidate_embs = [], [], []
                 for nc in bat:
@@ -523,9 +527,10 @@ class llmrec_model(nn.Module):
                         candi_tokens, candi_embeds, token=['[ItemOut]', '[HistoryEmb]'],
                         embs={'[HistoryEmb]': candidate_embs[0]})
                     candi_embeds, candi_mask = self.llm._prepend_soft_prompts(
-                        candi_embeds, candi_tokens.get('attention_mask'), task='lsr')
+                        candi_embeds, candi_tokens.get('attention_mask'), task='rps')
                     with torch.amp.autocast('cuda'):
-                        candi_outputs = self.llm.llm_model.forward(
+                        # .model 跳过 lm_head，不产生 vocab logits，省掉约 10 GB 显存
+                        candi_outputs = self.llm.llm_model.model.forward(
                             inputs_embeds=candi_embeds, attention_mask=candi_mask,
                             output_hidden_states=True)
                         indx = self.llm.get_embeddings(candi_tokens, '[ItemOut]', offset=k)
@@ -533,9 +538,13 @@ class llmrec_model(nn.Module):
                             candi_outputs.hidden_states[-1][i, indx[i]].mean(axis=0).unsqueeze(0)
                             for i in range(len(indx))])
                         item_outputs = self.llm.pred_item(item_outputs)
-                    self.all_embs.append(item_outputs)
-                    del candi_outputs, item_outputs
-            self.all_embs = torch.cat(self.all_embs)
+                    # CPU 上累积，避免 GPU 上同时保留所有 chunk
+                    all_embs_list.append(item_outputs.cpu())
+                    del candi_outputs, item_outputs, candi_embeds, candi_mask, candi_tokens
+            # cat 在 CPU 完成，峰值显存只有一个 chunk 而非全量
+            self.all_embs = torch.cat(all_embs_list).to(self.device)
+            del all_embs_list
+            torch.cuda.empty_cache()
 
         u, seq, pos, neg, rank, candi_set, files = data
         text_input, interact_embs, candidate = [], [], []
@@ -562,9 +571,10 @@ class llmrec_model(nn.Module):
                 llm_tokens, inputs_embeds, token=['[UserOut]', '[HistoryEmb]'],
                 embs={'[HistoryEmb]': interact_embs})
             inputs_embeds, new_mask = self.llm._prepend_soft_prompts(
-                inputs_embeds, llm_tokens.get('attention_mask'), task='lsr')
+                inputs_embeds, llm_tokens.get('attention_mask'), task='rps')
             with torch.amp.autocast('cuda'):
-                outputs = self.llm.llm_model.forward(
+                # .model 跳过 lm_head，不产生 vocab logits
+                outputs = self.llm.llm_model.model.forward(
                     inputs_embeds=inputs_embeds, attention_mask=new_mask,
                     output_hidden_states=True)
                 indx = self.llm.get_embeddings(llm_tokens, '[UserOut]', offset=k)
@@ -603,9 +613,10 @@ class llmrec_model(nn.Module):
                 llm_tokens, inputs_embeds, token=['[UserOut]', '[HistoryEmb]'],
                 embs={'[HistoryEmb]': interact_embs})
             inputs_embeds, new_mask = self.llm._prepend_soft_prompts(
-                inputs_embeds, llm_tokens.get('attention_mask'), task='lsr')
+                inputs_embeds, llm_tokens.get('attention_mask'), task='rps')
             with torch.amp.autocast('cuda'):
-                outputs = self.llm.llm_model.forward(
+                # .model 跳过 lm_head，不产生 vocab logits
+                outputs = self.llm.llm_model.model.forward(
                     inputs_embeds=inputs_embeds, attention_mask=new_mask,
                     output_hidden_states=True)
                 indx = self.llm.get_embeddings(llm_tokens, '[UserOut]', offset=k)
