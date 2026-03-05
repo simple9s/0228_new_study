@@ -12,8 +12,8 @@ class llm4rec(nn.Module):
         llm_model="",
         max_output_txt_len=256,
         args=None,
-        # ── Soft Prompt 新增参数 ──────────────────────────
-        num_soft_prompts: int = 8,   # k: soft token 数量，建议 5-10
+        # ── Soft Prompt 参数 ──────────────────────────────
+        num_soft_prompts: int = 8,   # k: soft token 数量，建议 50-100 对齐 DELRec
     ):
         super().__init__()
         self.device = device
@@ -57,13 +57,17 @@ class llm4rec(nn.Module):
             else:
                 param.requires_grad = False
 
-        # ── Soft Prompts: 唯一可学习的 LLM 侧参数 ────────
+        # ── 两组独立 Soft Prompts ─────────────────────────
+        # soft_prompts_ta  : 专门用于 Temporal Analysis 任务
+        # soft_prompts_rps : 专门用于 Recommendation Pattern Simulating 任务
+        # 两组独立学习各自任务的推荐模式，与 DELRec 原版设计对齐
+        # DELRec 原版每组 duplicate=100，建议 num_soft_prompts 设为 50~100
         d_llm = self.llm_model.config.hidden_size
-        # 初始化为 LLM embedding 层均值±std，让软提示"有意义地"开始
         with torch.no_grad():
             emb_weight = self.llm_model.model.embed_tokens.weight
             emb_mean = emb_weight.mean().item()
             emb_std  = emb_weight.std().item()
+
         if args.use_lora:
             lora_config = LoraConfig(
                 r=getattr(args, 'lora_r', 8),
@@ -74,29 +78,55 @@ class llm4rec(nn.Module):
             )
             self.llm_model = get_peft_model(self.llm_model, lora_config)
             self.llm_model.print_trainable_parameters()
-        self.soft_prompts = nn.Parameter(
-            torch.normal(emb_mean, emb_std, size=(num_soft_prompts, d_llm))
-        )  # shape: [k, d_llm]，requires_grad=True 默认
 
-        # ── CLS tokens (原有逻辑保持不变) ────────────────
+        # TA 任务软提示：学习时序分析模式（关注序列时间规律）
+        self.soft_prompts_ta = nn.Parameter(
+            torch.normal(emb_mean, emb_std, size=(num_soft_prompts, d_llm))
+        )  # shape: [k, d_llm]
+
+        # RPS 任务软提示：学习 SR 模型推荐行为模式（对齐 SASRec 输出）
+        self.soft_prompts_rps = nn.Parameter(
+            torch.normal(emb_mean, emb_std, size=(num_soft_prompts, d_llm))
+        )  # shape: [k, d_llm]
+
+        # LSR 任务软提示：Stage 2 专用，全新初始化，对齐 DELRec LSR template
+        # Stage 1 的 ta/rps 两组在 Stage 2 完全冻结且不参与 forward
+        self.soft_prompts_lsr = nn.Parameter(
+            torch.normal(emb_mean, emb_std, size=(num_soft_prompts, d_llm))
+        )  # shape: [k, d_llm]
+
+        # ── CLS tokens（原有逻辑保持不变）────────────────
         if not args.token:
             if args.nn_parameter:
                 self.CLS      = nn.Parameter(torch.normal(0, 1, size=(1, d_llm)))
                 self.CLS_item = nn.Parameter(torch.normal(0, 1, size=(1, d_llm)))
             else:
                 self.CLS = nn.Embedding(1, d_llm)
-                nn.init.normal_(self.CLS.weight,
-                                 mean=emb_mean, std=emb_std)
+                nn.init.normal_(self.CLS.weight, mean=emb_mean, std=emb_std)
                 self.CLS_item = nn.Embedding(1, d_llm)
-                nn.init.normal_(self.CLS_item.weight,
-                                 mean=emb_mean, std=emb_std)
+                nn.init.normal_(self.CLS_item.weight, mean=emb_mean, std=emb_std)
 
         # ── 用户 / 物品预测头 ─────────────────────────────
+        # pred_user        : Stage 2 主训练用
+        # pred_user_ta     : Stage 1 TA 任务专用，梯度路径与 RPS 完全隔离
+        # pred_user_rps    : Stage 1 RPS 任务专用，梯度路径与 TA 完全隔离
         self.pred_user = nn.Sequential(
             nn.Linear(d_llm, 2048), nn.LayerNorm(2048),
             nn.LeakyReLU(), nn.Linear(2048, 128))
         nn.init.xavier_normal_(self.pred_user[0].weight)
         nn.init.xavier_normal_(self.pred_user[3].weight)
+
+        self.pred_user_ta = nn.Sequential(
+            nn.Linear(d_llm, 2048), nn.LayerNorm(2048),
+            nn.LeakyReLU(), nn.Linear(2048, 128))
+        nn.init.xavier_normal_(self.pred_user_ta[0].weight)
+        nn.init.xavier_normal_(self.pred_user_ta[3].weight)
+
+        self.pred_user_rps = nn.Sequential(
+            nn.Linear(d_llm, 2048), nn.LayerNorm(2048),
+            nn.LeakyReLU(), nn.Linear(2048, 128))
+        nn.init.xavier_normal_(self.pred_user_rps[0].weight)
+        nn.init.xavier_normal_(self.pred_user_rps[3].weight)
 
         self.pred_item = nn.Sequential(
             nn.Linear(d_llm, 2048), nn.LayerNorm(2048),
@@ -110,31 +140,38 @@ class llm4rec(nn.Module):
         nn.init.xavier_normal_(self.pred_user_CF2[0].weight)
         nn.init.xavier_normal_(self.pred_user_CF2[3].weight)
 
-        # ── 辅助任务预测头 ────────────────────────────────
-        # TA head: 给定上下文，从 user_output 预测下一个 item（128-d 空间）
-        # RPS head: 将 user_output 映射到 CF 空间做对齐
-        # 复用 pred_user / pred_user_CF2 即可，无需新增，见 seqllm_model.py
-
         self.mse = nn.MSELoss()
         self.max_output_txt_len = max_output_txt_len
 
     # ─────────────────────────────────────────────────────────────
-    # 辅助：将 soft prompts 拼接到 embeds 前端，同时扩展 attention mask
+    # 核心改动：_prepend_soft_prompts 增加 task 参数
+    #   task='ta'  → 使用 soft_prompts_ta
+    #   task='rps' → 使用 soft_prompts_rps
+    #   task='lsr'    → 使用 soft_prompts_lsr（Stage 2 专用，对齐 DELRec LSR template）
     # ─────────────────────────────────────────────────────────────
-    def _prepend_soft_prompts(self, inputs_embeds, attention_mask=None):
+    def _prepend_soft_prompts(self, inputs_embeds, attention_mask=None, task='ta'):
         """
         inputs_embeds : [B, T, d]
-        attention_mask: [B, T]  or None
+        attention_mask: [B, T] or None
+        task          : 'ta' | 'rps' | 'lsr'
         返回:
-            new_embeds    : [B, k+T, d]
-            new_mask      : [B, k+T]  or None
+            new_embeds : [B, k+T, d]
+            new_mask   : [B, k+T] or None
         """
         B = inputs_embeds.shape[0]
         k = self.num_soft_prompts
-        # soft_prompts: [k, d] → [1, k, d] → [B, k, d]
-        sp = self.soft_prompts.unsqueeze(0).expand(B, -1, -1)
-        # cast to same dtype
-        sp = sp.to(inputs_embeds.dtype)
+
+        # 根据任务选择对应的软提示组
+        if task == 'rps':
+            sp = self.soft_prompts_rps
+        elif task == 'lsr':
+            sp = self.soft_prompts_lsr
+        else:
+            # 'ta' 默认
+            sp = self.soft_prompts_ta
+
+        # [k, d] → [1, k, d] → [B, k, d]，cast 到相同 dtype
+        sp = sp.unsqueeze(0).expand(B, -1, -1).to(inputs_embeds.dtype)
         new_embeds = torch.cat([sp, inputs_embeds], dim=1)  # [B, k+T, d]
 
         if attention_mask is not None:
@@ -257,26 +294,25 @@ class llm4rec(nn.Module):
             token, return_tensors="pt", add_special_tokens=False).input_ids.item()
         for inx in range(len(llm_tokens['input_ids'])):
             idx_tensor = (llm_tokens['input_ids'][inx] == token_id).nonzero().view(-1)
-            token_idx.append(idx_tensor + offset)   # ← 加上偏移
+            token_idx.append(idx_tensor + offset)
         return token_idx
 
     # ─────────────────────────────────────────────────────────────
-    # forward
+    # forward（Stage 2 走 train_mode0，task='lsr' 使用 soft_prompts_lsr）
     # ─────────────────────────────────────────────────────────────
     def forward(self, samples, mode=0):
         if mode == 0:
             return self.train_mode0(samples)
         elif mode == 1:
-            return self.train_mode1(samples)
+            raise NotImplementedError("train_mode1 is not implemented")
 
     def train_mode0(self, samples):
         """
-        核心改动：
-          1. 先做原有的 token 替换（HistoryEmb / UserOut / ItemOut）
-          2. 再将 soft_prompts 拼接到序列最前方
-          3. get_embeddings 时传 offset=num_soft_prompts
+        Stage 2 主训练 forward。
+        soft_prompts_ta / soft_prompts_rps 在此阶段均已冻结，
+        统一使用 task='lsr'（soft_prompts_lsr，Stage 2 专用可学习软提示）。
         """
-        max_input_length = 1024
+        max_input_length = 1024 + self.num_soft_prompts
         k = self.num_soft_prompts
 
         log_emb    = samples['log_emb']
@@ -288,17 +324,15 @@ class llm4rec(nn.Module):
 
         inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens['input_ids'])
 
-        # 替换特殊 token 嵌入（与原版一致）
         inputs_embeds = self.replace_out_token_all(
             llm_tokens, inputs_embeds,
             token=['[UserOut]', '[HistoryEmb]'],
             embs={'[HistoryEmb]': samples['interact']})
 
-        # ── ① 拼接 soft prompts ──────────────────────────
+        # Stage 2：task='lsr'，使用 soft_prompts_lsr（可学习，对齐 DELRec LSR template）
         inputs_embeds, new_mask = self._prepend_soft_prompts(
-            inputs_embeds, llm_tokens.get('attention_mask'))
+            inputs_embeds, llm_tokens.get('attention_mask'), task='lsr')
 
-        # 候选物品分支
         candi_tokens = self.llm_tokenizer(
             samples['candidates_pos'],
             return_tensors="pt", padding="longest",
@@ -310,23 +344,20 @@ class llm4rec(nn.Module):
             token=['[ItemOut]', '[HistoryEmb]'],
             embs={'[HistoryEmb]': samples['candidate_embs']})
 
-        # ── ② 候选分支也拼接 soft prompts ───────────────
+        # 候选分支同样用 soft_prompts_lsr
         candi_embeds, candi_mask = self._prepend_soft_prompts(
-            candi_embeds, candi_tokens.get('attention_mask'))
+            candi_embeds, candi_tokens.get('attention_mask'), task='lsr')
 
         with torch.amp.autocast('cuda'):
-            # 候选物品表示
             candi_outputs = self.llm_model.forward(
                 inputs_embeds=candi_embeds,
                 attention_mask=candi_mask,
                 output_hidden_states=True)
-            # ── ③ get_embeddings 加 offset ───────────────
             indx = self.get_embeddings(candi_tokens, '[ItemOut]', offset=k)
             item_outputs = torch.cat([
                 candi_outputs.hidden_states[-1][i, indx[i]].mean(axis=0).unsqueeze(0)
                 for i in range(len(indx))])
 
-            # 用户表示
             outputs = self.llm_model.forward(
                 inputs_embeds=inputs_embeds,
                 attention_mask=new_mask,
