@@ -396,6 +396,7 @@ class llm4rec(nn.Module):
         B = user_outputs.shape[0]
         candidate_num   = item_outputs.shape[0] // B
         item_outputs_3d = item_outputs.view(B, candidate_num, -1)      # [B, C, 128]
+        item_outputs_3d = item_outputs_3d.to(user_outputs.dtype)
         lsr_logits      = torch.bmm(item_outputs_3d,
                                     user_outputs.unsqueeze(2)).squeeze(2)  # [B, C]
         lsr_labels = torch.zeros(B, dtype=torch.long, device=lsr_logits.device)
